@@ -52,6 +52,9 @@ USB Webcam
     ▼
 Full-Resolution Capture
     │
+    ▼
+Frame Skipper (process every Nth frame, default N=3)
+    │
     ├──▶ Resize Copy for Inference
     │        ├──▶ Vehicle Detector (YOLO26x, COCO pre-trained, conf 0.3)
     │        └──▶ Plate Detector (YOLO-format model, conf 0.3)
@@ -104,11 +107,73 @@ Save Decision Engine
 
 ### 2. Plate Detection
 
-- Model: separate YOLO-format plate detector (specific model selected during implementation after testing on Syrian data)
-- Runs on **full frame** in parallel with vehicle detection
-- Confidence threshold: 0.3
+- **Primary model:** [`morsetechlab/yolov11-license-plate-detection`](https://huggingface.co/morsetechlab/yolov11-license-plate-detection)
+  — YOLO11-family plate detector on Hugging Face. Loads via Ultralytics
+  `YOLO()` identically to YOLO26 weights (no code differences between the two
+  detectors).
+- **Fallback:** [`keremberke/yolov8-license-plate`](https://huggingface.co/keremberke/yolov8-license-plate)
+  — older but widely deployed; swap to this if primary recall is poor on Syrian
+  plates during pre-flight validation.
+- Runs on **full frame** in parallel with vehicle detection.
+- Confidence threshold: 0.3.
+
+**Why not YOLO26-native?** No YOLO26 plate detector exists publicly yet.
+Phase 1 is a collector, so mixing a YOLO11 plate detector with a YOLO26x
+vehicle detector is acceptable. In Phase 2 both are replaced by a single
+fine-tuned YOLO26m trained on this pipeline's approved data.
 
 Low thresholds are acceptable for collection — review/filtering comes later.
+
+### 3. Pre-flight validation
+
+Before starting any long collection session, run a one-time sanity check:
+
+```bash
+python preflight.py --plate-model morsetechlab/yolov11-license-plate-detection \
+  --test-dir tests/syrian_plate_samples/   # 30–50 real Syrian plate photos
+```
+
+Expected output: per-image detection count, confidence, and a recall summary.
+
+Decision rule:
+
+- Recall ≥ ~70% → proceed with primary model.
+- Recall 50–70% → proceed but flag; consider fine-tuning sooner.
+- Recall < 50% → swap to fallback (`keremberke/yolov8-license-plate`) and
+  re-run pre-flight before any real data collection.
+
+Syrian published baselines are low (~61% with YOLOv2) so "perfect" recall
+is not expected — the goal is that enough plates land in the collection to
+bootstrap fine-tuning in Phase 2.
+
+---
+
+## Frame Skipping & Performance Budget
+
+Running YOLO26x plus a second YOLO plate model in parallel at 960px inference on a
+Mac — together with tracking, OpenCV drawing, and disk I/O — will saturate even
+modern Apple Silicon, drop frames unpredictably, and trigger thermal throttling.
+Real-time data collection does **not** require processing every camera frame: a
+target of 5–10 FPS is more than sufficient to capture high-quality tracks and
+respect the 2–3 second save cooldowns.
+
+### Policy
+
+- Capture at native camera FPS (e.g. 30 FPS) for smooth preview.
+- Run detection/tracking only on every Nth captured frame.
+- Default: `--frame-stride 3` (~10 FPS inference from a 30 FPS camera).
+- Skipped frames are still displayed live (with the most recent boxes drawn), so the
+  preview stays smooth while compute stays bounded.
+- Adaptive option: if inference wall-time exceeds the per-frame budget, auto-raise
+  stride to the next value (3 → 5 → 8) and log the change to the session stats.
+
+### Why not process every frame
+
+- Cooldowns (2–3 s) mean ≥90% of frames of the same track would be discarded anyway.
+- Dedup + better-save-replacement already picks the best crop over a time window,
+  so skipping frames rarely costs a usable sample.
+- Lower sustained load avoids thermal throttling that would *itself* cause dropped
+  and degraded frames.
 
 ---
 
@@ -152,6 +217,20 @@ A plate is a candidate child of a vehicle if any of these are true:
 - Plate center lies inside vehicle box
 - Plate box overlaps vehicle box above minimum threshold
 - Plate lies near the lower region of a plausible vehicle box
+- Plate sits within a proximity margin directly below a vehicle box (provisional match)
+
+### Proximity margin (trucks / buses / flatbeds)
+
+Large vehicles (trucks, buses, flatbeds) often have bumper-mounted plates that the
+vehicle detector truncates or misses entirely. To avoid losing these, allow a
+**provisional match** when a plate is otherwise unmatched but sits in a tight pixel
+margin directly below a vehicle bbox:
+
+- Horizontal: plate x-range overlaps vehicle x-range by at least 50%
+- Vertical: plate top edge is within `proximity_margin_px` below vehicle bottom edge
+- Default: `--proximity-margin-px 60` (tune per camera mount height)
+- Provisional matches are tagged `association_status = "matched_provisional"` in metadata
+  so review can treat them with extra scrutiny
 
 ### Score components
 
@@ -160,12 +239,14 @@ A plate is a candidate child of a vehicle if any of these are true:
 - Distance from plate center to vehicle bottom-center
 - Preference for plate center in lower half of vehicle box
 - Relative size plausibility
+- Proximity-below bonus (for truncated large-vehicle boxes)
 
 ### Output states
 
 Each plate ends as one of:
 
-- `matched` — clearly belongs to one vehicle
+- `matched` — clearly belongs to one vehicle (inside/overlapping)
+- `matched_provisional` — proximity match below a truncated vehicle box
 - `ambiguous` — could belong to multiple vehicles (do not force)
 - `unmatched` — no parent vehicle found (still saved)
 
@@ -409,6 +490,38 @@ Session-level stats saved to `raw/metadata/sessions.jsonl`:
 
 Three **separate, independent** Python modules — each callable on demand on any image.
 
+### Batching: image-grid composition (cost + rate-limit control)
+
+Sending one crop per API call is slow, hits rate limits quickly, and pays per-image
+token overhead on every request. All three modules instead **compose a grid** of
+crops into a single composite image and ask the API to return an array of results
+indexed by grid position.
+
+- Grid size: `--grid-size 3x3` (9 crops/call) default, up to `4x4` (16 crops/call)
+- Each cell is resized to a uniform tile (e.g. 512×512) with black padding; original
+  aspect ratio preserved
+- Cell index overlay (small label top-left: `0`…`N-1`) is drawn on the composite
+  before sending, so the model can reliably reference positions
+- The prompt asks for a JSON array of length N in row-major order; missing/illegible
+  cells must still emit an object with `"certainty": "low"` so index alignment is
+  preserved
+- A local mapping file is kept per batch call: `{cell_index → source_crop_path}` —
+  used to re-attach results to the original filenames when appending to the
+  per-module `*_results.jsonl`
+- Bbox-verify module grids at most 4 full frames per call (full frames are larger;
+  grid denser than 2×2 loses too much detail to be useful)
+- Retry policy: on rate limit, exponential backoff; on partial/mismatched array
+  length, fall back to single-image calls for that batch only
+
+CLI flags:
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--grid-size` | `3x3` | Crops per composite image (brand / plate modules) |
+| `--bbox-grid-size` | `2x2` | Frames per composite image (bbox module) |
+| `--tile-px` | `512` | Per-cell tile size in composite |
+| `--batch-fallback-on-mismatch` | `true` | Re-run mismatched batches one-by-one |
+
 ### Module 1: `verify_bbox(image_path)`
 
 Verify bounding box accuracy on a full frame + pseudo-label.
@@ -464,9 +577,41 @@ OCR a plate crop for Arabic + Latin text.
   "arabic_visible": true,
   "latin_visible": true,
   "plate_color_style": "white_blue",
-  "certainty": "medium"
+  "certainty": "medium",
+  "format_valid": true,
+  "format_flag": null
 }
 ```
+
+### Hallucination guardrail (plate OCR)
+
+Vision models occasionally hallucinate alphanumeric characters, especially on mixed
+Arabic/Latin Syrian plates. Before any result from Module 3 reaches the human
+review queue, it passes a **regex validation step** against known Syrian plate
+formats.
+
+Validated formats (representative — tuned during implementation):
+
+- Civilian private: `^[\u0600-\u06FF]{2,8}\s?\d{3,7}$` (Arabic governorate + digits)
+- Latin civilian: `^[A-Z]{2,8}\s?\d{3,7}$`
+- Two-line plates: validate each line independently, require at least one line of digits
+- Digits-only fallback: `^[\d٠-٩]{4,8}$` (Arabic-Indic or Western digits)
+
+Post-OCR logic:
+
+1. Normalize whitespace, strip decorative glyphs.
+2. Attempt each configured regex against `plate_text_original` and
+   `plate_text_latin`.
+3. If **no pattern matches**: set `format_valid = false`, set `format_flag` to one
+   of `hallucination_suspected` / `unknown_format` / `unreadable`, and **force**
+   `certainty = "low"` regardless of what the model returned.
+4. Invalid-format items are routed to a dedicated
+   `review/queues/plate_format_suspect.jsonl` queue so the human reviewer sees them
+   separately from normal `medium` items.
+5. Known-invalid items never auto-approve, even if the model claimed `high`.
+
+This stops the most common failure mode (a fluent-looking but fabricated plate
+string) before it pollutes the approved dataset.
 
 ### Certainty levels
 
@@ -561,10 +706,13 @@ Treat production OCR engine as a separate evaluation. Preserve enough metadata a
 | --- | --- | --- |
 | `--camera` | `0` | Camera device index |
 | `--vehicle-model` | `yolo26x.pt` | Vehicle detector model |
-| `--plate-model` | required | Plate detector model path |
+| `--plate-model` | `morsetechlab/yolov11-license-plate-detection` | Plate detector (HF repo id or local .pt path); fallback `keremberke/yolov8-license-plate` |
 | `--vehicle-conf` | `0.30` | Vehicle detection threshold |
 | `--plate-conf` | `0.30` | Plate detection threshold |
 | `--imgsz` | `960` | Inference image size |
+| `--frame-stride` | `3` | Run detection on every Nth captured frame (~10 FPS from 30 FPS camera) |
+| `--adaptive-stride` | `true` | Auto-raise stride (3→5→8) if inference can't keep up |
+| `--proximity-margin-px` | `60` | Pixels below vehicle bbox to allow provisional plate match (trucks/buses) |
 | `--output` | `./output` | Output directory |
 | `--vehicle-cooldown` | `3.0` | Seconds between vehicle saves |
 | `--plate-cooldown` | `2.0` | Seconds between plate saves |
@@ -585,9 +733,10 @@ Treat production OCR engine as a separate evaluation. Preserve enough metadata a
 ### Phase 1 — Collection
 
 ```text
-ultralytics          # YOLO26x
+ultralytics          # YOLO26x vehicle + YOLO11 plate (same loader)
 opencv-python        # Camera capture + display
 numpy                # Array operations
+huggingface_hub      # First-run download of plate detector weights
 ```
 
 ### Phase 1.5 — Review
@@ -628,7 +777,7 @@ Police-car-mounted Jetson Orin Nano (8GB):
 
 ## Phase 2 Training Notes
 
-- **YOLO fine-tuning:** Use only approved labels from Phase 1.5b. Fine-tune YOLO26m (pre-trained on COCO) to detect both `vehicle` and `plate` in a single pass.
+- **YOLO fine-tuning:** Use only approved labels from Phase 1.5b. Fine-tune YOLO26m (pre-trained on COCO) to detect both `vehicle` and `plate` in a single pass. This single fine-tuned model **replaces** both the Phase 1 YOLO26x vehicle detector and the YOLO11 plate detector — the two-model Phase 1 stack is a deliberate stopgap, not the production stack.
 - **Brand classifier:** Use AI-generated + human-verified brand labels from vehicle crops. Train ResNet-18 or EfficientNet-B0. Target: top Syrian car brands (20-50 classes).
 - **OCR training:** Use AI-generated + human-verified plate text labels. Fine-tune or train custom OCR for Arabic + Latin Syrian plate format. Compare against EasyOCR baseline.
 
