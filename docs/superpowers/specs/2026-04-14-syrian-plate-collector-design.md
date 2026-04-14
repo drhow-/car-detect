@@ -133,13 +133,23 @@ All configurable via command-line arguments or a config dict at the top of the s
 | `--cooldown` | 3 | Seconds between saves of same object |
 | `--no-display` | false | Run headless (no OpenCV window) |
 
+## Final Deployment Target
+
+Police car mounted system on Jetson Orin Nano (8GB):
+
+- Multiple simultaneous camera feeds
+- Single fine-tuned YOLO26m detecting cars + plates
+- Real-time OCR (Arabic + Latin) on detected plates
+- Saves: car photo, plate photo, plate text
+- Must run efficiently on edge hardware
+
 ## Phased Roadmap
 
 | Phase | Hardware | What | Model |
-|-------|----------|------|-------|
-| **1 - Collect** | Mac | This tool — collect training data | YOLO26x + plate model (two models) |
+| ----- | -------- | ---- | ----- |
+| **1 - Collect** | Mac | This tool — collect training data from single webcam | YOLO26x + plate model (two models) |
 | **2 - Train** | Cloud/Mac | Fine-tune single model for car+plate | YOLO26m |
-| **3 - Deploy** | Orin Nano | Single model + OCR on edge | YOLO26m (fine-tuned) + EasyOCR |
+| **3 - Deploy** | Orin Nano | Multi-cam, single model + OCR, police car | YOLO26m (fine-tuned) + EasyOCR |
 
 ## Error Handling
 
@@ -153,6 +163,6 @@ All configurable via command-line arguments or a config dict at the top of the s
 - OCR text reading
 - Database storage
 - Web interface
-- Multi-camera support
+- Multi-camera support (Phase 3)
 - Deep SORT or Re-ID tracking
-- Model training/fine-tuning scripts
+- Model training/fine-tuning scripts (Phase 2)
