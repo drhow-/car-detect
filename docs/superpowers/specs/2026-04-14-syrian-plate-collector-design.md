@@ -2,21 +2,47 @@
 
 ## Purpose
 
-A Python-based data collection pipeline that uses a USB webcam to detect cars and license plates in real-time, saving high-quality training data for:
+A Python-based **data collection pipeline** that uses a live USB webcam to detect vehicles and license plates in real time, saving high-value training data for:
 
-1. Fine-tuning a single YOLO26 model to detect both cars and plates
+1. Fine-tuning a single YOLO26 model to detect both vehicles and plates
 2. Collecting cropped plate images for future Arabic/Latin OCR training
-3. Collecting cropped car images for car brand/model classifier training
+3. Collecting cropped vehicle images for car brand/model classifier training
+4. Preserving metadata needed for later Jetson deployment, review, and dataset cleanup
 
-Target deployment: Jetson Orin Nano (8GB) in police cars — Phase 1 runs on Mac for data collection.
+Target deployment: **Jetson Orin Nano (8GB)** in police cars — Phase 1 runs on Mac for data collection.
+
+---
 
 ## Scope
 
 - Syrian license plates (Arabic + Latin characters)
 - Live USB webcam feed with real-time display
-- Smart deduplication (avoid saving thousands of identical frames)
-- Training-quality image output (full-res for crops, high-quality JPEG for frames)
-- Car-plate association (link each plate to its parent car)
+- Smarter deduplication with quality-aware save decisions
+- Training-quality crops (PNG) and high-quality saved frames (JPEG 95%)
+- Vehicle-plate association with scored matching
+- Raw/approved dataset separation from the beginning
+- Hard-negative sampling for model robustness
+
+---
+
+## Key Design Principles
+
+1. **Phase 1 is a collector, not the final production stack**
+   - Use two detectors now (YOLO26x for vehicles + plate model) for best collection quality.
+   - Do not force the final single-model pipeline into the collection stage.
+
+2. **Save metadata-rich raw data first**
+   - Pseudo-labels are useful but are not ground truth.
+   - Every saved object must carry enough metadata for review, filtering, and retraining.
+
+3. **Optimize for future edge deployment**
+   - Structure outputs so they can later feed a TensorRT / DeepStream Jetson deployment.
+
+4. **Prefer quality over quantity**
+   - Do not save every detected frame.
+   - Save when novelty, quality, and usefulness justify it.
+
+---
 
 ## Architecture
 
@@ -24,233 +50,394 @@ Target deployment: Jetson Orin Nano (8GB) in police cars — Phase 1 runs on Mac
 USB Webcam
     │
     ▼
-OpenCV Capture (full resolution)
+Full-Resolution Capture
     │
-    ├──▶ YOLO26x ── Car Detection (COCO pre-trained, conf 0.3)
-    │
-    ├──▶ Plate Detection Model ── License Plate Detection (full frame, conf 0.3)
+    ├──▶ Resize Copy for Inference
+    │        ├──▶ Vehicle Detector (YOLO26x, COCO pre-trained, conf 0.3)
+    │        └──▶ Plate Detector (YOLO-format model, conf 0.3)
+    │               (both run in parallel on same frame)
     │
     ▼
-Association Engine ── Link plates to cars (plate bbox inside car bbox)
+Tracking Layer
+    │   ├── Vehicle tracks (centroid + IoU + size + class)
+    │   └── Plate tracks
     │
-    ├──▶ Live Display (bounding boxes + counters)
+    ▼
+Association Engine
+    │   └── Scored vehicle ↔ plate matching
+    │         (matched / ambiguous / unmatched)
     │
-    ├──▶ Dedup Check ── Only save when new/changed object detected
-    │       │
-    │       ├──▶ Full Frame Saver ── dataset/images/ (JPEG 95%) + dataset/labels/ (pseudo-labels)
-    │       ├──▶ Car Cropper ── crops/cars/YYYY-MM-DD/ (PNG)
-    │       ├──▶ Plate Cropper ── crops/plates/YYYY-MM-DD/ (PNG)
-    │       └──▶ Detection Log ── detections.jsonl (car-plate associations per save)
+    ▼
+Quality Gate
+    │   ├── Blur / sharpness check
+    │   ├── Size thresholds (min plate w/h, min vehicle area)
+    │   ├── Truncation check (at image boundaries)
+    │   ├── Exposure sanity check
+    │   └── Save-worthiness score
     │
-    └──▶ Stats Tracker ── stats.json
+    ▼
+Save Decision Engine
+    │   ├── New object → save
+    │   ├── Cooldown expired + quality OK → save
+    │   ├── Better-quality replacement → resave
+    │   └── Hard-negative → save with negative flag
+    │
+    ├──▶ Raw Frame Save (JPEG 95%)
+    ├──▶ Raw Vehicle Crop Save (PNG)
+    ├──▶ Raw Plate Crop Save (PNG)
+    ├──▶ Pseudo-label Save (YOLO format)
+    ├──▶ Metadata JSONL Save
+    │
+    └──▶ Live Display (OpenCV window with boxes + counters)
 ```
 
-## Components
+---
 
-### 1. Camera Capture
+## Detection Models
 
-- OpenCV VideoCapture from USB webcam (device index 0)
-- Capture at full camera resolution (no downscaling for saved images)
-- Detection runs on a resized frame for speed; crops taken from original resolution frame
+### 1. Vehicle Detection
 
-### 2. Car Detection
-
-- Model: YOLO26x pre-trained on COCO
-- Classes: `car`, `truck`, `bus` (vehicle types)
-- Confidence threshold: 0.3 (lower for data collection — capture borderline cases)
-- Runs on full frame
-
-### 3. Plate Detection
-
-- Model: Pre-trained license plate detection model (YOLO-format, sourced from Roboflow/HuggingFace — specific model to be selected during implementation)
-- Runs on **full frame** in parallel with car detection (not sequential, not on car crops)
+- Model: **YOLO26x** pre-trained on COCO (`yolo26x.pt`)
+- COCO classes used: `car`, `truck`, `bus`
+- Collapsed to single class `vehicle` in saved labels
 - Confidence threshold: 0.3
 
-### 4. Car-Plate Association
+### 2. Plate Detection
 
-- After both models run, link plates to cars using spatial overlap
-- A plate belongs to a car if the plate bounding box is **inside or mostly overlapping** (>50% IoU) the car bounding box
-- Unmatched plates (no parent car) are still saved — the car body may be partially out of frame
-- Association saved in `detections.jsonl` per save event
+- Model: separate YOLO-format plate detector (specific model selected during implementation after testing on Syrian data)
+- Runs on **full frame** in parallel with vehicle detection
+- Confidence threshold: 0.3
 
-### 5. Smart Deduplication
+Low thresholds are acceptable for collection — review/filtering comes later.
 
-- Track detected objects using **centroid tracking** (center point distance between frames)
-- Assign a tracker ID to each unique car/plate
-- Save only when:
-  - A new object appears (centroid not within distance threshold of any known object)
-  - An existing tracked object hasn't been saved for `cooldown` seconds
-- Cooldown: minimum 3 seconds between saves of the same tracked object
-- Remove stale trackers after 5 seconds of no match (object left the frame)
-- **Full frames are only saved when a crop save is triggered** — no standalone frame saves
-- Uses simple centroid tracking (no deep SORT needed for Phase 1)
+---
 
-### 6. Image Saving
+## Tracking Policy
 
-#### Full Frames + Pseudo-Labels (for fine-tuning)
+### Matching between frames
 
-- Save full-resolution frame as **JPEG 95% quality**: `dataset/images/frame_{counter:06d}.jpg`
-- Save corresponding YOLO pseudo-label: `dataset/labels/frame_{counter:06d}.txt`
-- Label format: `class_id x_center y_center width height` (normalized 0-1)
-- Class mapping: `0 = car`, `1 = plate`
-- **Only saved when dedup triggers a crop save** — not on every detection frame
-- **Important:** These are auto-generated pseudo-labels, NOT verified ground truth. They require review/correction before use in training.
+Combine multiple signals for robust tracking:
 
-#### Car Crops (for brand classifier training)
+- Centroid distance
+- IoU overlap
+- Box size similarity
+- Class consistency
 
-- Crop car region from full-res frame with 10% padding
-- Save as **PNG**: `crops/cars/YYYY-MM-DD/car_{counter:04d}_{timestamp}.png`
-- These crops will be labeled with brand/model in Phase 1.5
+### Track record fields
 
-#### Plate Crops (for OCR training)
+Each active track stores:
 
-- Crop plate region from full-res frame with 5% padding
-- Save as **PNG**: `crops/plates/YYYY-MM-DD/plate_{counter:04d}_{timestamp}.png`
+- `track_id`
+- `object_type` (vehicle / plate)
+- `first_seen_ts`
+- `last_seen_ts`
+- `last_saved_ts`
+- `save_count`
+- `best_quality_score`
+- `best_crop_path`
 
-#### Detection Log (car-plate associations)
+### Stale track removal
 
-- Append one JSON line per save event to `detections.jsonl`
-- Links car crops to their plate crops and to the full frame
+- Default timeout: 4.0 seconds
+- Remove tracks that have not matched within timeout
+
+---
+
+## Vehicle-Plate Association
+
+### Scored matching (not simple containment)
+
+A plate is a candidate child of a vehicle if any of these are true:
+
+- Plate center lies inside vehicle box
+- Plate box overlaps vehicle box above minimum threshold
+- Plate lies near the lower region of a plausible vehicle box
+
+### Score components
+
+- Containment score
+- Overlap score
+- Distance from plate center to vehicle bottom-center
+- Preference for plate center in lower half of vehicle box
+- Relative size plausibility
+
+### Output states
+
+Each plate ends as one of:
+
+- `matched` — clearly belongs to one vehicle
+- `ambiguous` — could belong to multiple vehicles (do not force)
+- `unmatched` — no parent vehicle found (still saved)
+
+---
+
+## Quality Gate
+
+Only save when detections are useful for training.
+
+### Per-crop checks
+
+- Blur / sharpness score (Laplacian variance)
+- Crop width and height in pixels
+- Crop area in pixels
+- Truncation at image boundaries
+- Basic exposure sanity
+
+### Save-worthiness thresholds
+
+- Minimum plate width: 40px
+- Minimum plate height: 14px
+- Minimum vehicle area: 12,000px
+- Blur score above configurable threshold
+- Crop not excessively truncated (>30% outside frame = reject)
+
+### Better-save replacement
+
+Even if the same track was already saved, save again when the new observation is materially better:
+
+- Sharper plate crop
+- Larger visible vehicle crop
+- Less truncation
+- Clearer view
+
+---
+
+## Save Decision Logic
+
+Save when **any** of the following is true:
+
+1. A new track appears and passes quality gate
+2. Cooldown has expired and quality is acceptable
+3. Current observation is significantly better than last saved version
+4. Observation qualifies as a useful hard negative
+
+### Default cooldowns
+
+- Vehicle cooldown: 3.0 seconds
+- Plate cooldown: 2.0 seconds
+
+---
+
+## Hard-Negative Sampling
+
+Phase 1 intentionally preserves difficult examples for training robustness:
+
+- Vehicle with no visible plate
+- Partial plate
+- Blurred plate
+- Sign or sticker mistaken for plate
+- Crowded overlapping vehicles
+- Far-distance vehicles
+- Low-light difficult cases
+
+Marked explicitly in metadata with `negative_type` field.
+
+---
+
+## Image Saving Policy
+
+### 1. Raw Full Frames
+
+Save only when at least one crop-worthy or hard-negative event triggers.
+
+- Format: **JPEG 95%**
+- Path: `raw/frames/YYYY-MM-DD/frm_{session_id}_{timestamp_ms}_{frame_idx}.jpg`
+
+### 2. Raw Vehicle Crops
+
+- Source: full-resolution original frame
+- Padding: 10%
+- Format: **PNG**
+- Path: `raw/crops/vehicles/YYYY-MM-DD/veh_{session_id}_{track_id}_{timestamp_ms}.png`
+
+### 3. Raw Plate Crops
+
+- Source: full-resolution original frame
+- Padding: 5%
+- Format: **PNG**
+- Path: `raw/crops/plates/YYYY-MM-DD/plt_{session_id}_{track_id}_{timestamp_ms}.png`
+
+### 4. Pseudo-Labels
+
+- YOLO-format label file per saved raw frame
+- Format: `class_id x_center y_center width height` (normalized 0-1)
+- Class mapping: `0 = vehicle`, `1 = plate`
+- Path: `raw/labels/YYYY-MM-DD/frm_{session_id}_{timestamp_ms}_{frame_idx}.txt`
+
+**Important:** Pseudo-labels are unverified until approved through review pipeline.
+
+---
+
+## Metadata Logging
+
+JSONL as canonical event log format.
+
+### Metadata files
+
+- `raw/metadata/save_events.jsonl` — primary event log
+- `raw/metadata/tracks.jsonl` — track lifecycle records
+- `raw/metadata/sessions.jsonl` — session start/end stats
+
+### Save event schema
 
 ```json
 {
-  "timestamp": "2026-04-14T14:30:22",
-  "frame": "dataset/images/frame_000001.jpg",
+  "event_id": "evt_000001",
+  "session_id": "sess_20260414_cam0_a1b2",
+  "timestamp": "2026-04-14T14:30:22.481Z",
+  "camera_id": "cam0",
+  "frame_path": "raw/frames/2026-04-14/frm_sess_20260414_cam0_a1b2_1713105022481_000123.jpg",
+  "label_path": "raw/labels/2026-04-14/frm_sess_20260414_cam0_a1b2_1713105022481_000123.txt",
+  "image_width": 1920,
+  "image_height": 1080,
   "detections": [
     {
-      "car_crop": "crops/cars/2026-04-14/car_0001_20260414_143022.png",
-      "car_bbox": [120, 80, 450, 320],
-      "plate_crop": "crops/plates/2026-04-14/plate_0001_20260414_143022.png",
-      "plate_bbox": [200, 280, 340, 310]
+      "object_type": "vehicle",
+      "track_id": "veh_17",
+      "vehicle_type": "car",
+      "bbox_xyxy": [120, 80, 450, 320],
+      "detector_conf": 0.81,
+      "crop_path": "raw/crops/vehicles/2026-04-14/veh_sess_a1b2_veh17_1713105022481.png",
+      "quality_score": 0.86,
+      "blur_score": 142.2,
+      "truncated": false,
+      "occluded": false,
+      "associated_plate_track_id": "plt_44",
+      "negative_type": null,
+      "review_status": "pending"
     },
     {
-      "car_crop": "crops/cars/2026-04-14/car_0002_20260414_143022.png",
-      "car_bbox": [500, 100, 780, 350],
-      "plate_crop": null,
-      "plate_bbox": null
+      "object_type": "plate",
+      "track_id": "plt_44",
+      "bbox_xyxy": [200, 280, 340, 310],
+      "detector_conf": 0.77,
+      "crop_path": "raw/crops/plates/2026-04-14/plt_sess_a1b2_plt44_1713105022481.png",
+      "quality_score": 0.74,
+      "blur_score": 119.5,
+      "truncated": false,
+      "occluded": false,
+      "association_status": "matched",
+      "associated_vehicle_track_id": "veh_17",
+      "association_score": 0.92,
+      "negative_type": null,
+      "review_status": "pending"
     }
   ]
 }
 ```
 
-### 7. Live Display
-
-- OpenCV window showing the camera feed
-- Green bounding boxes around cars with label "CAR"
-- Red bounding boxes around plates with label "PLATE"
-- Lines connecting plates to their parent cars
-- Overlay counters: "Cars: X | Plates: X | Frames: X"
-- Press `q` to quit cleanly
+---
 
 ## Output Directory Structure
 
 ```text
 output/
-├── dataset/
-│   ├── images/
-│   │   ├── frame_000001.jpg
-│   │   └── frame_000002.jpg
+├── raw/
+│   ├── frames/
+│   │   └── YYYY-MM-DD/
 │   ├── labels/
-│   │   ├── frame_000001.txt
-│   │   └── frame_000002.txt
-│   └── classes.txt              # "car\nplate"
-├── crops/
-│   ├── cars/
-│   │   └── 2026-04-14/
-│   │       ├── car_0001_20260414_143022.png
-│   │       └── car_0002_20260414_143045.png
-│   └── plates/
-│       └── 2026-04-14/
-│           ├── plate_0001_20260414_143022.png
-│           └── plate_0002_20260414_143045.png
-├── detections.jsonl             # Car-plate associations per save
-└── stats.json                   # Session stats (total counts, duration)
+│   │   └── YYYY-MM-DD/
+│   ├── crops/
+│   │   ├── vehicles/
+│   │   │   └── YYYY-MM-DD/
+│   │   └── plates/
+│   │       └── YYYY-MM-DD/
+│   ├── metadata/
+│   │   ├── save_events.jsonl
+│   │   ├── tracks.jsonl
+│   │   └── sessions.jsonl
+│   └── classes.txt                # "vehicle\nplate"
+├── review/
+│   ├── ai/
+│   │   ├── bbox_results.jsonl
+│   │   ├── brand_results.jsonl
+│   │   └── plate_results.jsonl
+│   ├── human/
+│   │   └── review_log.jsonl
+│   └── queues/
+│       ├── bbox_queue.jsonl
+│       ├── brand_queue.jsonl
+│       └── plate_queue.jsonl
+├── approved/
+│   ├── detector/
+│   │   ├── images/
+│   │   └── labels/
+│   ├── ocr/
+│   │   ├── plate_crops/
+│   │   └── plate_labels.jsonl
+│   └── vehicle_classifier/
+│       ├── vehicle_crops/
+│       └── brand_labels.jsonl
+└── rejected/
+    ├── detector/
+    ├── ocr/
+    └── vehicle_classifier/
 ```
 
-## Dependencies
+---
 
-### Phase 1 — Data Collection
+## Live Display
 
-```text
-ultralytics          # YOLO26x
-opencv-python        # Camera capture + display
-numpy                # Array operations
-```
+- OpenCV preview window
+- Green boxes for vehicles with label "VEHICLE"
+- Red boxes for plates with label "PLATE"
+- Lines connecting matched plate to parent vehicle
+- Overlay counters:
+  - Vehicles detected / Plates detected
+  - Active tracks
+  - Saved events
+  - Rejected-by-quality count
+- Press `q` to quit cleanly
 
-### Phase 1.5 — AI Review
+---
 
-```text
-anthropic            # Claude Vision API (or google-generativeai for Gemini)
-Pillow               # Image loading for API
-```
+## Session Statistics
 
-## Configuration
+Session-level stats saved to `raw/metadata/sessions.jsonl`:
 
-All configurable via command-line arguments or a config dict at the top of the script:
+- Session start/end time and duration
+- Total frames processed
+- Total detections (vehicle / plate)
+- Total saved events
+- Saves by object type
+- Rejects by blur / size / cooldown
+- Matched / unmatched / ambiguous plates
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `--camera` | 0 | Camera device index |
-| `--car-conf` | 0.3 | Car detection confidence threshold |
-| `--plate-conf` | 0.3 | Plate detection confidence threshold |
-| `--output` | `./output` | Output directory |
-| `--cooldown` | 3 | Seconds between saves of same object |
-| `--no-display` | false | Run headless (no OpenCV window) |
+---
 
-## Final Deployment Target
+## Phase 1.5 — AI Review Pipeline
 
-Police car mounted system on Jetson Orin Nano (8GB):
-
-- Multiple simultaneous camera feeds
-- Single fine-tuned YOLO26m detecting cars + plates
-- Lightweight brand/model classifier (ResNet/EfficientNet) on car crops
-- Real-time OCR (Arabic + Latin) on detected plates
-- Saves: car photo, car brand/model, plate photo, plate text
-- Car-plate associations maintained
-- Must run efficiently on edge hardware
-
-## Phased Roadmap
-
-| Phase | Hardware | What | Models |
-| --- | --- | --- | --- |
-| **1 - Collect** | Mac | This tool — collect training data from single webcam | YOLO26x + plate model (two models, temporary) |
-| **1.5 - AI Review** | Cloud API | Send images to Claude/Gemini Vision for auto-verification and labeling | Claude Vision / Gemini Vision API |
-| **1.5b - Human Review** | Mac | Human reviews AI-flagged items, approves/rejects via review tool | Python review CLI |
-| **2 - Train** | Cloud/Mac | Fine-tune models on approved data only | YOLO26m + ResNet/EfficientNet classifier |
-| **3 - Deploy** | Orin Nano | Multi-cam, detection + brand ID + OCR, police car | YOLO26m + brand classifier + EasyOCR |
-
-## Phase 1.5 — AI-Assisted Label Verification
-
-Three **separate, independent** Python modules — each callable on demand on any image. Run one, all, or re-run individually without affecting the others.
+Three **separate, independent** Python modules — each callable on demand on any image.
 
 ### Module 1: `verify_bbox(image_path)`
 
-Verify bounding box accuracy on a full frame + its pseudo-label.
+Verify bounding box accuracy on a full frame + pseudo-label.
 
-- Input: full frame image + YOLO label file
+- Input: raw full frame + YOLO label file
 - Sends to Claude/Gemini Vision API
-- Output: appends to `review/bbox_results.jsonl`
+- Output: appends to `review/ai/bbox_results.jsonl`
 
 ```json
 {
-  "image": "frame_000001.jpg",
+  "image": "frm_sess_a1b2_1713105022481_000123.jpg",
   "bbox_quality": "good",
-  "issues": [],
+  "missing_objects": [],
+  "false_positives": [],
   "certainty": "high"
 }
 ```
 
 ### Module 2: `detect_brand(car_crop_path)`
 
-Identify car brand and model from a car crop image.
+Identify vehicle brand and model from a vehicle crop.
 
-- Input: single car crop image
+- Input: single vehicle crop image
 - Sends to Claude/Gemini Vision API
-- Output: appends to `review/brand_results.jsonl`
+- Output: appends to `review/ai/brand_results.jsonl`
 
 ```json
 {
-  "image": "car_0001_20260414_143022.png",
+  "image": "veh_sess_a1b2_veh17_1713105022481.png",
   "brand": "Toyota",
   "model": "Corolla",
   "year_estimate": "2015-2020",
@@ -260,89 +447,192 @@ Identify car brand and model from a car crop image.
 
 ### Module 3: `read_plate(plate_crop_path)`
 
-OCR a plate crop image for Arabic + Latin text.
+OCR a plate crop for Arabic + Latin text.
 
 - Input: single plate crop image
 - Sends to Claude/Gemini Vision API
-- Output: appends to `review/plate_results.jsonl`
+- Output: appends to `review/ai/plate_results.jsonl`
 
 ```json
 {
-  "image": "plate_0001_20260414_143022.png",
+  "image": "plt_sess_a1b2_plt44_1713105022481.png",
   "plate_text_original": "دمشق ٣٤٥٦٧٨",
   "plate_text_latin": "Damascus 345678",
+  "plate_layout_type": "two_line",
+  "line_count": 2,
+  "governorate_text_visible": true,
+  "arabic_visible": true,
+  "latin_visible": true,
+  "plate_color_style": "white_blue",
   "certainty": "medium"
 }
 ```
 
-### Certainty Levels
+### Certainty levels
 
-- **high** — AI is confident, auto-approved (no human review needed)
-- **medium** — AI is somewhat sure, flagged for human review
-- **low** — AI is unsure or confused, requires human review
+- **high** — auto-approved, low review priority
+- **medium** — human review recommended
+- **low** — human review required
+
+"High" does not mean guaranteed correct — spot-checks are still valuable.
 
 ### CLI Usage
 
 ```bash
 # Run individually on a single image
-python review.py bbox --image dataset/images/frame_000001.jpg
-python review.py brand --image crops/cars/2026-04-14/car_0001.png
-python review.py plate --image crops/plates/2026-04-14/plate_0001.png
+python review.py bbox --image raw/frames/2026-04-14/frm_*.jpg
+python review.py brand --image raw/crops/vehicles/2026-04-14/veh_*.png
+python review.py plate --image raw/crops/plates/2026-04-14/plt_*.png
 
 # Run on entire folder
-python review.py bbox --dir dataset/images/
-python review.py brand --dir crops/cars/
-python review.py plate --dir crops/plates/
+python review.py bbox --dir raw/frames/
+python review.py brand --dir raw/crops/vehicles/
+python review.py plate --dir raw/crops/plates/
 
 # Run all three on everything
 python review.py all --output-dir output/
 ```
 
+---
+
 ## Phase 1.5b — Human Review Tool
 
-A Python CLI tool that shows flagged items one by one for human approval.
+Python CLI tool for reviewing AI-flagged items.
 
-### How It Works
+### Usage
 
 ```bash
-python human_review.py --review-dir review/ --crops-dir crops/
+python human_review.py --review-dir review/ --raw-dir raw/
 ```
+
+### Per-item actions
 
 For each flagged item (certainty = medium or low):
 
-1. Opens the image in a viewer (OpenCV window or system image viewer)
-2. Shows the AI label (brand, plate text, or bbox quality)
+1. Opens image in OpenCV window
+2. Shows AI label (brand, plate text, or bbox quality)
 3. Human presses:
    - `y` — approve as-is
-   - `n` — reject (moves to rejected/)
+   - `n` — reject
    - `e` — edit (type corrected label)
    - `s` — skip for later
 
-### Review Output
+### Promotion targets
+
+- Approved detector data → `approved/detector/`
+- Approved OCR data → `approved/ocr/`
+- Approved brand data → `approved/vehicle_classifier/`
+- Rejected data → `rejected/{detector,ocr,vehicle_classifier}/`
+
+### Review log
+
+All decisions logged to `review/human/review_log.jsonl`.
+
+---
+
+## OCR Strategy
+
+### Short term (Phase 1.5)
+
+Use cloud vision APIs (Claude/Gemini) + baseline OCR as labeling aids.
+
+### Long term (Phase 3)
+
+Treat production OCR engine as a separate evaluation. Preserve enough metadata and reviewed plate crops to compare:
+
+- EasyOCR baseline
+- Custom OCR model
+- LPR-style model on Jetson
+
+### Plate metadata to preserve
+
+- `plate_layout_type` (one_line / two_line)
+- `line_count`
+- `governorate_text_visible`
+- `arabic_visible`
+- `latin_visible`
+- `plate_color_style`
+
+---
+
+## Configuration
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--camera` | `0` | Camera device index |
+| `--vehicle-model` | `yolo26x.pt` | Vehicle detector model |
+| `--plate-model` | required | Plate detector model path |
+| `--vehicle-conf` | `0.30` | Vehicle detection threshold |
+| `--plate-conf` | `0.30` | Plate detection threshold |
+| `--imgsz` | `960` | Inference image size |
+| `--output` | `./output` | Output directory |
+| `--vehicle-cooldown` | `3.0` | Seconds between vehicle saves |
+| `--plate-cooldown` | `2.0` | Seconds between plate saves |
+| `--track-timeout` | `4.0` | Track stale timeout |
+| `--min-plate-w` | `40` | Minimum plate width in pixels |
+| `--min-plate-h` | `14` | Minimum plate height in pixels |
+| `--min-vehicle-area` | `12000` | Minimum vehicle crop area |
+| `--min-blur-score` | configurable | Blur rejection threshold |
+| `--save-better-only` | `true` | Save again only if new crop is better |
+| `--save-hard-negatives` | `true` | Keep useful negative examples |
+| `--no-display` | `false` | Run headless (no OpenCV window) |
+| `--session-id` | auto-generated | Session identifier |
+
+---
+
+## Dependencies
+
+### Phase 1 — Collection
 
 ```text
-output/
-├── dataset/
-│   ├── approved/
-│   │   ├── images/              # Verified frames
-│   │   ├── labels/              # Corrected YOLO labels
-│   │   ├── car_labels.jsonl     # Brand/model labels (verified)
-│   │   └── plate_labels.jsonl   # OCR text labels (verified)
-│   └── rejected/
-│       ├── images/              # Bad detections
-│       └── labels/              # Incorrect labels
-├── review/
-│   ├── bbox_results.jsonl       # AI bbox verification results
-│   ├── brand_results.jsonl      # AI brand detection results
-│   ├── plate_results.jsonl      # AI plate OCR results
-│   └── human_review_log.jsonl   # Human decisions (approve/reject/edit)
+ultralytics          # YOLO26x
+opencv-python        # Camera capture + display
+numpy                # Array operations
 ```
+
+### Phase 1.5 — Review
+
+```text
+anthropic            # Claude Vision API
+google-generativeai  # Gemini Vision API (alternative)
+Pillow               # Image loading for API
+```
+
+---
+
+## Final Deployment Target
+
+Police-car-mounted Jetson Orin Nano (8GB):
+
+- Multiple simultaneous camera feeds
+- Single fine-tuned YOLO26m detecting vehicle + plate
+- Lightweight vehicle brand/model classifier (ResNet-18 or EfficientNet-B0)
+- Real-time OCR for Arabic + Latin Syrian plates
+- Reliable vehicle-plate association
+- Optimized edge inference (TensorRT / DeepStream)
+- Output per detection: **vehicle photo + brand/model + plate photo + plate text**
+
+---
+
+## Phased Roadmap
+
+| Phase | Hardware | What | Models / Stack |
+| --- | --- | --- | --- |
+| **1 - Collect** | Mac | Real-time data collection from USB webcam | YOLO26x (vehicle) + plate detector (two models) |
+| **1.5 - AI Review** | Cloud API | Label triage: bbox verify, brand detect, plate OCR | Claude / Gemini Vision API |
+| **1.5b - Human Review** | Mac | Approve, reject, or correct AI labels | Python review CLI |
+| **2 - Train** | Mac / Cloud | Train on approved data only | YOLO26m (vehicle+plate) + brand classifier + OCR model |
+| **3 - Deploy** | Orin Nano | Edge inference in police car, multi-cam | TensorRT YOLO26m + classifier + OCR |
+
+---
 
 ## Phase 2 Training Notes
 
-- **YOLO fine-tuning:** Use only approved labels from Phase 1.5b. Fine-tune YOLO26m (pre-trained on COCO) to detect both `car` and `plate` in a single pass.
-- **Brand classifier:** Use AI-generated + human-verified brand labels from car crops. Train a lightweight classifier (ResNet-18 or EfficientNet-B0). Target: top Syrian car brands (likely 20-50 classes).
-- **OCR training:** Use AI-generated + human-verified plate text labels. Fine-tune EasyOCR or train a custom model for Arabic + Latin Syrian plate format.
+- **YOLO fine-tuning:** Use only approved labels from Phase 1.5b. Fine-tune YOLO26m (pre-trained on COCO) to detect both `vehicle` and `plate` in a single pass.
+- **Brand classifier:** Use AI-generated + human-verified brand labels from vehicle crops. Train ResNet-18 or EfficientNet-B0. Target: top Syrian car brands (20-50 classes).
+- **OCR training:** Use AI-generated + human-verified plate text labels. Fine-tune or train custom OCR for Arabic + Latin Syrian plate format. Compare against EasyOCR baseline.
+
+---
 
 ## Error Handling
 
@@ -353,12 +643,14 @@ output/
 - API rate limit (Phase 1.5): retry with exponential backoff
 - API error (Phase 1.5): log error, skip image, continue
 
+---
+
 ## Out of Scope (Phase 1)
 
-- OCR text reading (Phase 1.5 / Phase 3)
-- Car brand/model classification (Phase 1.5 / Phase 3)
+- Final OCR deployment (Phase 3)
+- Final vehicle brand/model classifier training (Phase 2)
 - Database storage
 - Web interface
-- Multi-camera support (Phase 3)
-- Deep SORT or Re-ID tracking
-- Model training/fine-tuning scripts (Phase 2)
+- Production multi-camera synchronization (Phase 3)
+- Full DeepStream implementation (Phase 3)
+- Model fine-tuning scripts (Phase 2)
