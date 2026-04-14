@@ -162,14 +162,66 @@ Police car mounted system on Jetson Orin Nano (8GB):
 | Phase | Hardware | What | Models |
 | --- | --- | --- | --- |
 | **1 - Collect** | Mac | This tool — collect training data from single webcam | YOLO26x + plate model (two models, temporary) |
-| **2 - Train** | Cloud/Mac | Fine-tune single YOLO for car+plate, train brand classifier, review pseudo-labels | YOLO26m + ResNet/EfficientNet classifier |
+| **1.5 - AI Review** | Cloud API | Send images to Claude/Gemini Vision for auto-verification and labeling | Claude Vision / Gemini Vision API |
+| **1.5b - Human Review** | Mac | Human reviews AI-corrected labels, approves/rejects | Review UI or labeled folder structure |
+| **2 - Train** | Cloud/Mac | Fine-tune models on approved data only | YOLO26m + ResNet/EfficientNet classifier |
 | **3 - Deploy** | Orin Nano | Multi-cam, detection + brand ID + OCR, police car | YOLO26m + brand classifier + EasyOCR |
+
+## Phase 1.5 — AI-Assisted Label Verification
+
+A Python script that processes the collected data from Phase 1 through a large vision model (Claude or Gemini) for automated verification and labeling.
+
+### AI Review (Phase 1.5)
+
+For each saved image, send to Claude/Gemini Vision API to:
+
+1. **Verify bounding boxes** — Is the car/plate correctly boxed? Rate accuracy (good/bad/partial)
+2. **Identify car brand/model** — Auto-label car crops (e.g., "Toyota Corolla", "Kia Picanto")
+3. **Read plate text** — Auto-label plate crops with Arabic + Latin text
+4. **Flag ambiguous cases** — Low confidence items marked for human attention
+
+Output per image:
+
+```text
+{
+  "image": "car_0001_20260414_143022.png",
+  "bbox_quality": "good",           // good | partial | bad
+  "brand": "Toyota Corolla",        // AI-detected brand/model
+  "brand_confidence": 0.92,
+  "plate_text": "دمشق ٣٤٥٦٧٨",     // AI-read plate text
+  "plate_confidence": 0.87,
+  "needs_human_review": false       // true if any confidence < 0.7
+}
+```
+
+### Human Review (Phase 1.5b)
+
+- Only flagged/low-confidence items require manual review
+- Human approves, corrects, or rejects each flagged item
+- Approved data moves to `dataset/approved/`
+- Rejected data moves to `dataset/rejected/`
+- Expected: ~90% auto-approved by AI, ~10% needs human review
+
+### Review Output Structure
+
+```text
+output/
+├── dataset/
+│   ├── approved/
+│   │   ├── images/          # Verified frames
+│   │   ├── labels/          # Corrected YOLO labels
+│   │   ├── car_labels.json  # Brand/model labels
+│   │   └── plate_labels.json # OCR text labels
+│   └── rejected/
+│       ├── images/          # Bad detections
+│       └── labels/          # Incorrect labels
+```
 
 ## Phase 2 Training Notes
 
-- **YOLO fine-tuning:** Use reviewed/corrected pseudo-labels from Phase 1 dataset. Fine-tune YOLO26m (pre-trained on COCO) to detect both `car` and `plate` in a single pass.
-- **Brand classifier:** Label car crops with brand/model names. Train a lightweight classifier (ResNet-18 or EfficientNet-B0) on labeled car crops. Target: top Syrian car brands (likely 20-50 classes).
-- **OCR training:** Label plate crops with plate text. Fine-tune EasyOCR or train a custom model for Arabic + Latin Syrian plate format.
+- **YOLO fine-tuning:** Use only approved labels from Phase 1.5b. Fine-tune YOLO26m (pre-trained on COCO) to detect both `car` and `plate` in a single pass.
+- **Brand classifier:** Use AI-generated + human-verified brand labels from car crops. Train a lightweight classifier (ResNet-18 or EfficientNet-B0). Target: top Syrian car brands (likely 20-50 classes).
+- **OCR training:** Use AI-generated + human-verified plate text labels. Fine-tune EasyOCR or train a custom model for Arabic + Latin Syrian plate format.
 
 ## Error Handling
 
