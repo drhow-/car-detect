@@ -169,29 +169,77 @@ Police car mounted system on Jetson Orin Nano (8GB):
 
 ## Phase 1.5 — AI-Assisted Label Verification
 
-A Python script that processes the collected data from Phase 1 through a large vision model (Claude or Gemini) for automated verification and labeling.
+Three **separate, independent** Python modules — each callable on demand on any image. Run one, all, or re-run individually without affecting the others.
 
-### AI Review (Phase 1.5)
+### Module 1: `verify_bbox(image_path)`
 
-For each saved image, send to Claude/Gemini Vision API to:
+Verify bounding box accuracy on a full frame + its pseudo-label.
 
-1. **Verify bounding boxes** — Is the car/plate correctly boxed? Rate accuracy (good/bad/partial)
-2. **Identify car brand/model** — Auto-label car crops (e.g., "Toyota Corolla", "Kia Picanto")
-3. **Read plate text** — Auto-label plate crops with Arabic + Latin text
-4. **Flag ambiguous cases** — Low confidence items marked for human attention
+- Input: full frame image + YOLO label file
+- Sends to Claude/Gemini Vision API
+- Output: `bbox_results.json`
 
-Output per image:
+```json
+{
+  "image": "frame_000001.jpg",
+  "bbox_quality": "good",
+  "issues": [],
+  "needs_human_review": false
+}
+```
 
-```text
+### Module 2: `detect_brand(car_crop_path)`
+
+Identify car brand and model from a car crop image.
+
+- Input: single car crop image
+- Sends to Claude/Gemini Vision API
+- Output: `brand_results.json`
+
+```json
 {
   "image": "car_0001_20260414_143022.png",
-  "bbox_quality": "good",           // good | partial | bad
-  "brand": "Toyota Corolla",        // AI-detected brand/model
-  "brand_confidence": 0.92,
-  "plate_text": "دمشق ٣٤٥٦٧٨",     // AI-read plate text
-  "plate_confidence": 0.87,
-  "needs_human_review": false       // true if any confidence < 0.7
+  "brand": "Toyota",
+  "model": "Corolla",
+  "year_estimate": "2015-2020",
+  "confidence": 0.92,
+  "needs_human_review": false
 }
+```
+
+### Module 3: `read_plate(plate_crop_path)`
+
+OCR a plate crop image for Arabic + Latin text.
+
+- Input: single plate crop image
+- Sends to Claude/Gemini Vision API
+- Output: `plate_results.json`
+
+```json
+{
+  "image": "plate_0001_20260414_143022.png",
+  "plate_text_original": "دمشق ٣٤٥٦٧٨",
+  "plate_text_latin": "Damascus 345678",
+  "confidence": 0.87,
+  "needs_human_review": false
+}
+```
+
+### CLI Usage
+
+```bash
+# Run individually on a single image
+python review.py bbox --image dataset/images/frame_000001.jpg
+python review.py brand --image crops/cars/2026-04-14/car_0001.png
+python review.py plate --image crops/plates/2026-04-14/plate_0001.png
+
+# Run on entire folder
+python review.py bbox --dir dataset/images/
+python review.py brand --dir crops/cars/
+python review.py plate --dir crops/plates/
+
+# Run all three on everything
+python review.py all --output-dir output/
 ```
 
 ### Human Review (Phase 1.5b)
